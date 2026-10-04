@@ -1,15 +1,16 @@
-// Supabase Edge Function: AI actions with credit metering.
-// Secrets required: ANTHROPIC_API_KEY (SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY are injected).
+// Supabase Edge Function: AI actions with credit metering, powered by Google Gemini.
+// Secret required: GEMINI_API_KEY (SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY are injected).
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type" };
-const MODEL = Deno.env.get("AI_MODEL") ?? "claude-sonnet-5-5";
+const MODEL = Deno.env.get("AI_MODEL") ?? "gemini-2.5-flash";
 const SAFETY = "You are decision-support for qualified radiology professionals. Never give a definitive diagnosis, never sign or approve anything. Use cautious language ('suggests', 'consider'). All output is a draft for professional review.";
+const REPORT = `{"clinical_indication":string,"technique":string,"comparison":string,"findings":string,"impression":string,"recommendations":string}`;
 
 const ACTIONS: Record<string, { cost: number; system: string; json?: boolean }> = {
-  analyze_study: { cost: 20, json: true, system: `${SAFETY} Given study metadata and clinical info, return JSON: {"study_organization":string,"detected_details":string[],"suggested_observations":string[],"differential_considerations":string[],"draft_report":{"clinical_indication":string,"technique":string,"comparison":string,"findings":string,"impression":string,"recommendations":string}}` },
+  analyze_study: { cost: 20, json: true, system: `${SAFETY} Given study metadata and clinical info, return JSON: {"study_organization":string,"detected_details":string[],"suggested_observations":string[],"differential_considerations":string[],"draft_report":${REPORT}}` },
   copilot: { cost: 5, system: `${SAFETY} You are a radiology-focused clinical copilot: organize findings, explore differentials, clarify terminology, flag missing context. End with 'Questions to review'.` },
-  draft_report: { cost: 10, json: true, system: `${SAFETY} Convert dictation/observations into JSON {"clinical_indication":string,"technique":string,"comparison":string,"findings":string,"impression":string,"recommendations":string}. Do not invent findings that were not provided.` },
+  draft_report: { cost: 10, json: true, system: `${SAFETY} Convert dictation/observations into JSON ${REPORT}. Do not invent findings that were not provided.` },
   quality_review: { cost: 8, json: true, system: `${SAFETY} Review the draft report. Return JSON {"items":[{"check":"Laterality|Findings vs impression|Missing measurements|Ambiguous language|Follow-up clarity|Contradictions|Incomplete sections","status":"ok|review","detail":string}]}. Never rewrite the report.` },
   extract_request: { cost: 5, json: true, system: `${SAFETY} Extract from the referral JSON {"patient":string,"requested_exam":string,"clinical_question":string,"history":string,"missing_details":string[],"questions_for_review":string[]}.` },
   scribe: { cost: 8, system: `${SAFETY} Turn the consultation transcript into a concise structured clinical note (History, Findings discussed, Plan).` },
@@ -36,18 +37,22 @@ Deno.serve(async (req) => {
     const { data: ok } = await admin.rpc("spend_credits", { o: org.id, n: spec.cost });
     if (!ok) return json({ error: "Not enough AI credits. Upgrade your plan in Settings." }, 402);
 
-    const msgs = messages ?? [{ role: "user", content: typeof input === "string" ? input : JSON.stringify(input) }];
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    const msgs: { role: string; content: string }[] = messages ?? [{ role: "user", content: typeof input === "string" ? input : JSON.stringify(input) }];
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
       method: "POST",
-      headers: { "x-api-key": Deno.env.get("ANTHROPIC_API_KEY")!, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-      body: JSON.stringify({ model: MODEL, max_tokens: 2048, system: spec.system + (spec.json ? " Respond with JSON only." : ""), messages: msgs }),
+      headers: { "x-goog-api-key": Deno.env.get("GEMINI_API_KEY")!, "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: spec.system }] },
+        contents: msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
+        generationConfig: { maxOutputTokens: 4096, ...(spec.json ? { responseMimeType: "application/json" } : {}) },
+      }),
     });
     if (!r.ok) {
       await admin.rpc("spend_credits", { o: org.id, n: -spec.cost }); // refund
       return json({ error: "AI provider error" }, 502);
     }
     const out = await r.json();
-    const text: string = out.content?.[0]?.text ?? "";
+    const text: string = out.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text ?? "").join("") ?? "";
     await admin.from("audit_log").insert({ org_id: org.id, user_id: u.user.id, action: `ai:${action}` });
     if (spec.json) {
       const m = text.match(/\{[\s\S]*\}/);
