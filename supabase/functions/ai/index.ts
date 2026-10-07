@@ -3,7 +3,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type" };
-const MODEL = Deno.env.get("AI_MODEL") ?? "gemini-2.5-flash";
+const MODEL = Deno.env.get("AI_MODEL") ?? "gemini-3.8-flash";
 const SAFETY = "You are decision-support for qualified radiology professionals. Never give a definitive diagnosis, never sign or approve anything. Use cautious language ('suggests', 'consider'). All output is a draft for professional review.";
 const REPORT = `{"clinical_indication":string,"technique":string,"comparison":string,"findings":string,"impression":string,"recommendations":string}`;
 
@@ -38,7 +38,7 @@ Deno.serve(async (req) => {
     if (!ok) return json({ error: "Not enough AI credits. Upgrade your plan in Settings." }, 402);
 
     const msgs: { role: string; content: string }[] = messages ?? [{ role: "user", content: typeof input === "string" ? input : JSON.stringify(input) }];
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
+    const call = () => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
       method: "POST",
       headers: { "x-goog-api-key": Deno.env.get("GEMINI_API_KEY")!, "content-type": "application/json" },
       body: JSON.stringify({
@@ -47,6 +47,11 @@ Deno.serve(async (req) => {
         generationConfig: { maxOutputTokens: 4096, ...(spec.json ? { responseMimeType: "application/json" } : {}) },
       }),
     });
+    let r = await call();
+    for (let i = 0; i < 2 && (r.status === 503 || r.status === 429); i++) { // transient overload: retry
+      await new Promise((res) => setTimeout(res, 1500 * (i + 1)));
+      r = await call();
+    }
     if (!r.ok) {
       await admin.rpc("spend_credits", { o: org.id, n: -spec.cost }); // refund
       return json({ error: "AI provider error" }, 502);
